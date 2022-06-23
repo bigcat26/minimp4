@@ -389,6 +389,7 @@ void MP4D_close(MP4D_demux_t *mp4);
 */
 const void *MP4D_read_sps(const MP4D_demux_t *mp4, unsigned int ntrack, int nsps, int *sps_bytes);
 const void *MP4D_read_pps(const MP4D_demux_t *mp4, unsigned int ntrack, int npps, int *pps_bytes);
+const void *MP4D_read_vps(const MP4D_demux_t *mp4, unsigned int ntrack, int nvps, int *vps_bytes);
 
 #if MP4D_PRINT_INFO_SUPPORTED
 /**
@@ -2280,7 +2281,7 @@ static int mp4_h265_write_nal(mp4_h26x_writer_t *h, const unsigned char *nal, in
     int payload_type = (nal[0] >> 1) & 0x3f;
     int is_intra = payload_type >= HEVC_NAL_BLA_W_LP && payload_type <= HEVC_NAL_CRA_NUT;
     int err = MP4E_STATUS_OK;
-    //printf("payload_type=%d, intra=%d\n", payload_type, is_intra);
+    // printf("payload_type=%d, intra=%d\n", payload_type, is_intra);
 
     if (is_intra && !h->need_sps && !h->need_pps && !h->need_vps)
         h->need_idr = 0;
@@ -2999,6 +3000,7 @@ broken_android_meta_hack:
 
 #if MP4D_AVC_SUPPORTED
         case BOX_avc1:  // AVCSampleEntry extends VisualSampleEntry
+        case BOX_hvc1:
 //         case BOX_avc2:   - no test
 //         case BOX_svc1:   - no test
         case BOX_mp4v:
@@ -3023,6 +3025,93 @@ broken_android_meta_hack:
             //      BOX_m4ds (optional)
             // for BOX_mp4v:
             //      BOX_esds
+            break;
+
+        case BOX_hvcC:
+            tr->object_type_indication = MP4_OBJECT_TYPE_HEVC;
+            tr->dsi = (unsigned char*)malloc((size_t)box_bytes);
+            tr->dsi_bytes = (unsigned)box_bytes;
+            {
+                unsigned char *p = tr->dsi;
+                unsigned char configurationVersion = READ(1);
+                // unsigned int(2) general_profile_space;
+                // unsigned int(1) general_tier_flag;
+                // unsigned int(5) general_profile_idc;
+                unsigned char generalProfileIdcEtc = READ(1);
+                unsigned int generalProfileCompatibilityFlags = READ(4);
+                // unsigned int(48) general_constraint_indicator_flags;
+                unsigned char generalConstraintIndicator[6];
+                generalConstraintIndicator[0] = READ(1);
+                generalConstraintIndicator[1] = READ(1);
+                generalConstraintIndicator[2] = READ(1);
+                generalConstraintIndicator[3] = READ(1);
+                generalConstraintIndicator[4] = READ(1);
+                generalConstraintIndicator[5] = READ(1);
+                unsigned char generalLevelIdc = READ(1);
+                // bit(4) reserved = ‘1111’b;
+                // unsigned int(12) min_spatial_segmentation_idc;
+                unsigned int minSpatialSegmentationIdc = READ(2);                    
+                // bit(6) reserved = ‘111111’b;
+                // unsigned int(2) parallelismType;
+                unsigned char parallelismType = READ(1);
+                // bit(6) reserved = ‘111111’b;
+                // unsigned int(2) chroma_format_idc;
+                unsigned char chromaFormatIdc = READ(1);
+                // bit(5) reserved = ‘11111’b;
+                // unsigned int(3) bit_depth_luma_minus8;
+                unsigned char bitDepthLumaMinus8 = READ(1);
+                // bit(5) reserved = ‘11111’b;
+                // unsigned int(3) bit_depth_chroma_minus8;
+                unsigned char bitDepthChromaMinus8 = READ(1);
+                // bit(16) avgFrameRate;
+                unsigned int avgFrameRate = READ(2);
+                // bit(2) constantFrameRate;
+                // bit(3) numTemporalLayers;
+                // bit(1) temporalIdNested;
+                // unsigned int(2) lengthSizeMinusOne;
+                unsigned char lengthSizeMinusOneEtc = READ(1);
+                
+                (void)configurationVersion;
+                (void)generalProfileIdcEtc;
+                (void)generalProfileCompatibilityFlags;
+                (void)generalConstraintIndicator;
+                (void)generalLevelIdc;
+                (void)minSpatialSegmentationIdc;
+                (void)parallelismType;
+                (void)chromaFormatIdc;
+                (void)bitDepthLumaMinus8;
+                (void)bitDepthChromaMinus8;
+                (void)avgFrameRate;
+                (void)lengthSizeMinusOneEtc;
+
+                // unsigned int(8) numOfArrays;
+                unsigned char numOfArrays = READ(1);
+                *p++ = numOfArrays;
+                for (i = 0; i < numOfArrays; i++)
+                {
+                    // bit(1) array_completeness;
+                    // unsigned int(1) reserved = 0;
+                    // unsigned int(6) NAL_unit_type;
+                    int j;
+                    unsigned char naluTypesEtc = READ(1);
+                    unsigned char naluType = naluTypesEtc & 0x3F;
+                    unsigned int numNalus = READ(2);
+                    // nalu type + numNalus * (naluLength + data)
+                    *p++ = naluTypesEtc;
+                    *p++ = numNalus >> 8;
+                    *p++ = numNalus & 0xFF;
+                    for (j = 0; j < numNalus; j++)
+                    {
+                        unsigned short k, nalUnitLength = READ(2);
+                        *p++ = nalUnitLength >> 8;
+                        *p++ = nalUnitLength & 0xFF;
+                        for (k = 0; k < nalUnitLength; k++)
+                        {
+                            *p++ = READ(1);
+                        }
+                    }
+                }
+            }
             break;
 
         case BOX_avcC:  // AVCDecoderConfigurationRecord()
@@ -3322,6 +3411,41 @@ static int skip_spspps(const unsigned char *p, int nbytes, int nskip)
     return k;
 }
 
+static const void *MP4D_read_hevc(const MP4D_demux_t *mp4, unsigned int ntrack, unsigned char type, int index, int *bytes) 
+{
+    unsigned char i, j, num_objects, num_nalus, nalu_type, *p, *e;
+    unsigned short nalu_length;
+    if (ntrack >= mp4->track_count)
+        return NULL;
+
+    p = mp4->track[ntrack].dsi;
+    e = p + mp4->track[ntrack].dsi_bytes;
+    num_objects = *p++;
+
+    for (i = 0; i < num_objects; ++i) 
+    {
+        nalu_type = *p++ & 0x3f;
+        num_nalus = (*p++ << 8) | *p++;
+        if (nalu_type == type && index >= num_nalus)
+        {
+            return NULL;
+        }
+
+        for (j = 0; j < num_nalus; ++j)
+        {
+            nalu_length = (*p++ << 8) | *p++;
+            if (nalu_type == type && j == index)
+            {
+                *bytes = nalu_length;
+                return p;
+            }
+            p += nalu_length;
+        }
+    }
+
+    return NULL;
+}
+
 static const void *MP4D_read_spspps(const MP4D_demux_t *mp4, unsigned int ntrack, int pps_flag, int nsps, int *sps_bytes)
 {
     int sps_count, skip_bytes;
@@ -3329,6 +3453,8 @@ static const void *MP4D_read_spspps(const MP4D_demux_t *mp4, unsigned int ntrack
     unsigned char *p = mp4->track[ntrack].dsi;
     if (ntrack >= mp4->track_count)
         return NULL;
+    if (mp4->track[ntrack].object_type_indication == MP4_OBJECT_TYPE_HEVC)
+        return MP4D_read_hevc(mp4, ntrack, pps_flag ? HEVC_NAL_PPS : HEVC_NAL_SPS, nsps, sps_bytes);
     if (mp4->track[ntrack].object_type_indication != MP4_OBJECT_TYPE_AVC)
         return NULL;    // SPS/PPS are specific for AVC format only
 
@@ -3354,7 +3480,6 @@ static const void *MP4D_read_spspps(const MP4D_demux_t *mp4, unsigned int ntrack
     return p + bytepos + 2;
 }
 
-
 const void *MP4D_read_sps(const MP4D_demux_t *mp4, unsigned int ntrack, int nsps, int *sps_bytes)
 {
     return MP4D_read_spspps(mp4, ntrack, 0, nsps, sps_bytes);
@@ -3363,6 +3488,11 @@ const void *MP4D_read_sps(const MP4D_demux_t *mp4, unsigned int ntrack, int nsps
 const void *MP4D_read_pps(const MP4D_demux_t *mp4, unsigned int ntrack, int npps, int *pps_bytes)
 {
     return MP4D_read_spspps(mp4, ntrack, 1, npps, pps_bytes);
+}
+
+const void *MP4D_read_vps(const MP4D_demux_t *mp4, unsigned int ntrack, int nvps, int *vps_bytes)
+{
+    return MP4D_read_hevc(mp4, ntrack, HEVC_NAL_VPS, nvps, vps_bytes);
 }
 
 #if MP4D_PRINT_INFO_SUPPORTED
