@@ -47,14 +47,17 @@ extern "C" {
 #define MP4D_INFO_SUPPORTED       1
 
 // Enable code, which prints to stdout supplementary MP4 information:
-#define MP4D_PRINT_INFO_SUPPORTED 0
+#define MP4D_PRINT_INFO_SUPPORTED 1
 
 #define MP4D_AVC_SUPPORTED        1
 #define MP4D_HEVC_SUPPORTED       1
 #define MP4D_TIMESTAMPS_SUPPORTED 1
+#define MP4D_FRAGMENT_SUPPORTED   0
 
 // Enable TrackFragmentBaseMediaDecodeTimeBox support
 #define MP4D_TFDT_SUPPORT         0
+
+#define MP4D_FILEOPS_SUPPORT      1
 
 /************************************************************************/
 /*          Some values of MP4(E/D)_track_t->object_type_indication     */
@@ -275,15 +278,30 @@ typedef struct
 
 } MP4D_track_t;
 
+#if MP4D_FILEOPS_SUPPORT
+typedef struct MP4D_fileops_tag
+{
+    unsigned long (*read_callback)(void *buffer, size_t size, size_t nmemb, void *token);
+    int (*seek_callback)(void *token, long offset, int whence);
+    int (*eof_callback)(void *token);
+} MP4D_fileops_t;
+#endif
+
 typedef struct MP4D_demux_tag
 {
     /************************************************************************/
     /*                 mandatory public data                                */
     /************************************************************************/
+#if !MP4D_FILEOPS_SUPPORT
     int64_t read_pos;
+#endif
     int64_t read_size;
     MP4D_track_t *track;
+#if MP4D_FILEOPS_SUPPORT
+    MP4D_fileops_t fops;
+#else
     int (*read_callback)(int64_t offset, void *buffer, size_t size, void *token);
+#endif
     void *token;
 
     unsigned track_count; // number of tracks in the movie
@@ -357,7 +375,11 @@ int mp4_h26x_write_nal(mp4_h26x_writer_t *h, const unsigned char *nal, int lengt
 *   It is guaranteed that function will read/seek sequentially,
 *   and will never jump back.
 */
+#if MP4D_FILEOPS_SUPPORT
+int MP4D_open(MP4D_demux_t *mp4, MP4D_fileops_t *ops, void *token, int64_t file_size);
+#else
 int MP4D_open(MP4D_demux_t *mp4, int (*read_callback)(int64_t offset, void *buffer, size_t size, void *token), void *token, int64_t file_size);
+#endif
 
 /**
 *   Return position and size for given sample from given track. The 'sample' is a
@@ -2469,9 +2491,14 @@ exit_with_free:
 static int minimp4_fgets(MP4D_demux_t *mp4)
 {
     uint8_t c;
+#if MP4D_FILEOPS_SUPPORT
+    if (mp4->fops.read_callback(&c, 1, 1, mp4->token) != 1)
+        return -1;
+#else
     if (mp4->read_callback(mp4->read_pos, &c, 1, mp4->token))
         return -1;
     mp4->read_pos++;
+#endif
     return c;
 }
 
@@ -2519,9 +2546,14 @@ static uint32_t read_payload(MP4D_demux_t *mp4, unsigned nb, boxsize_t *payload_
 */
 static void my_fseek(MP4D_demux_t *mp4, boxsize_t pos, int *eof_flag)
 {
+#if MP4D_FILEOPS_SUPPORT
+    mp4->fops.seek_callback(mp4->token, pos, SEEK_CUR);
+    *eof_flag = mp4->fops.eof_callback(mp4->token);
+#else
     mp4->read_pos += pos;
     if (mp4->read_pos >= mp4->read_size)
         *eof_flag = 1;
+#endif
 }
 
 #define READ(n) read_payload(mp4, n, &payload_bytes, &eof_flag)
@@ -2548,7 +2580,11 @@ static void my_fseek(MP4D_demux_t *mp4, boxsize_t pos, int *eof_flag)
 
 typedef enum { BOX_ATOM, BOX_OD } boxtype_t;
 
+#if MP4D_FILEOPS_SUPPORT
+int MP4D_open(MP4D_demux_t *mp4, MP4D_fileops_t *ops, void *token, int64_t file_size)
+#else
 int MP4D_open(MP4D_demux_t *mp4, int (*read_callback)(int64_t offset, void *buffer, size_t size, void *token), void *token, int64_t file_size)
+#endif
 {
     // box stack size
     int depth = 0;
@@ -2572,14 +2608,31 @@ int MP4D_open(MP4D_demux_t *mp4, int (*read_callback)(int64_t offset, void *buff
     unsigned i;
     MP4D_track_t *tr = NULL;
 
-    if (!mp4 || !read_callback)
+    if (!mp4)
     {
-        TRACE(("\nERROR: invlaid arguments!"));
+        TRACE(("\nERROR: invalid demux arguments!"));
         return 0;
     }
+#if MP4D_FILEOPS_SUPPORT
+    if (!ops || !ops->read_callback || !ops->eof_callback || !ops->seek_callback)
+    {
+        TRACE(("\nERROR: invalid fileops arguments!"));
+        return 0;
+    }
+#else
+    if (!callback)
+    {
+        TRACE(("\nERROR: invalid callback argument!"));
+        return 0;
+    }
+#endif
 
     memset(mp4, 0, sizeof(MP4D_demux_t));
+#if MP4D_FILEOPS_SUPPORT
+    memcpy(&mp4->fops, ops, sizeof(MP4D_fileops_t));
+#else
     mp4->read_callback = read_callback;
+#endif
     mp4->token = token;
     mp4->read_size = file_size;
 
@@ -2633,7 +2686,9 @@ int MP4D_open(MP4D_demux_t *mp4, int (*read_callback)(int64_t offset, void *buff
             {OD_DSI,   BOX_OD},
             {BOX_trak, BOX_ATOM},
             {BOX_moov, BOX_ATOM},
-            //{BOX_moof, BOX_ATOM},
+#if MP4D_FRAGMENT_SUPPORTED
+            {BOX_moof, BOX_ATOM},
+#endif
             {BOX_mdia, BOX_ATOM},
             {BOX_tref, BOX_ATOM},
             {BOX_minf, BOX_ATOM},
